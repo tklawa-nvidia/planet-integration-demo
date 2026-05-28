@@ -34,11 +34,14 @@ usage_exit() {
   echo "  Usage: ./install.sh [options] [sandbox-name]"
   echo ""
   echo "  Options:"
-  echo "    --port <N>         Host proxy port (default: 9201)"
-  echo "    --update-key       Force prompt for a new Planet API key"
-  echo "    --uninstall        Stop proxy, remove skill, drop policy block, clean local files"
-  echo "    --status           Show current install + proxy state"
-  echo "    -h, --help         Show this help"
+  echo "    --port <N>          Host proxy port (default: 9201)"
+  echo "    --update-key        Force prompt for a new Planet API key"
+  echo "    --no-restart-daemon Skip restarting the openclaw daemon after skill deploy"
+  echo "                        (you'll have to restart it manually for tools.profile=coding"
+  echo "                        to take full effect; only meaningful on the new layout)"
+  echo "    --uninstall         Stop proxy, remove skill, drop policy block, clean local files"
+  echo "    --status            Show current install + proxy state"
+  echo "    -h, --help          Show this help"
   echo ""
   echo "  Env vars:"
   echo "    PLANET_PROXY_HOST  Override auto-detected host IP for the sandbox→host bridge"
@@ -131,15 +134,17 @@ SANDBOX_NAME=""
 UPDATE_KEY=false
 DO_UNINSTALL=false
 DO_STATUS=false
+RESTART_DAEMON=true
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --port)        TOKEN_PORT="$2"; shift 2 ;;
-    --update-key)  UPDATE_KEY=true; shift ;;
-    --uninstall)   DO_UNINSTALL=true; shift ;;
-    --status)      DO_STATUS=true; shift ;;
-    -h|--help)     usage_exit ;;
-    -*)            fail "Unknown option: $1" ;;
+    --port)               TOKEN_PORT="$2"; shift 2 ;;
+    --update-key)         UPDATE_KEY=true; shift ;;
+    --no-restart-daemon)  RESTART_DAEMON=false; shift ;;
+    --uninstall)          DO_UNINSTALL=true; shift ;;
+    --status)             DO_STATUS=true; shift ;;
+    -h|--help)            usage_exit ;;
+    -*)                   fail "Unknown option: $1" ;;
     *)
       if [ -z "$SANDBOX_NAME" ]; then SANDBOX_NAME="$1"; shift
       else fail "Unknown argument: $1"; fi ;;
@@ -388,23 +393,25 @@ POLICY_FILE=$(mktemp /tmp/planet-policy-XXXX.yaml)
 
 # Use python (single process, no fragile awk range / grep|head pipeline that
 # trips `set -euo pipefail` on a no-match grep) to introspect the policy.
+# Script is passed via `-c '...'` (single-quoted, no bash expansion) so the
+# policy YAML can be piped on stdin — `python3 - <<HEREDOC` would steal stdin
+# for the script source and leave sys.stdin.read() empty.
 # Outputs: "<has_planet_proxy>|<host>|<port>|<has_old_planet_data_api>".
-POLICY_INFO=$(printf '%s' "$CURRENT_POLICY" | python3 - <<'PYEOF' || echo "false||| false"
+POLICY_INFO=$(printf '%s' "$CURRENT_POLICY" | python3 -c '
 import sys, re
 p = sys.stdin.read()
-has_proxy = 'planet_proxy:' in p
-has_old   = 'planet_data_api:' in p
-host = ''
-port = ''
+has_proxy = "planet_proxy:" in p
+has_old   = "planet_data_api:" in p
+host = ""
+port = ""
 m = re.search(
-    r'^  planet_proxy:\n(?:    .*\n)*?    endpoints:\n    - host:\s*[\'"]?([^\'"\n]+)[\'"]?\n      port:\s*(\d+)',
+    r"^  planet_proxy:\n(?:    .*\n)*?    endpoints:\n    - host:\s*[\x27\x22]?([^\x27\x22\n]+)[\x27\x22]?\n      port:\s*(\d+)",
     p, re.MULTILINE,
 )
 if m:
     host, port = m.group(1).strip(), m.group(2).strip()
-print('{}|{}|{}|{}'.format('true' if has_proxy else 'false', host, port, 'true' if has_old else 'false'))
-PYEOF
-)
+print("{}|{}|{}|{}".format("true" if has_proxy else "false", host, port, "true" if has_old else "false"))
+' || echo "false|||false")
 HAS_PROXY_BLOCK=$(echo "$POLICY_INFO" | cut -d'|' -f1)
 CURRENT_HOST=$(echo "$POLICY_INFO"   | cut -d'|' -f2)
 CURRENT_PORT=$(echo "$POLICY_INFO"   | cut -d'|' -f3)
@@ -460,9 +467,9 @@ proxy_block = '''  planet_proxy:
     - path: /usr/local/bin/node
 '''.format(host=host_ip, port=token_port)
 
-# Inject under network_policies: if present, otherwise add the key first.
-# The proxy_block is already indented with 2 spaces, so it's a child of
-# a top-level `network_policies:` key.
+# Inject under network_policies if present, otherwise add the key first.
+# The proxy_block is already indented with 2 spaces, so it nests under a
+# top-level network_policies key.
 if 'network_policies:' in policy:
     policy = policy.rstrip() + '\n' + proxy_block
 else:
@@ -521,6 +528,44 @@ ENVEOF"
 ssh_sandbox "chmod 600 $SKILLS_BASE/planet/.env"
 ok "Proxy URL deployed (no API key in sandbox)"
 
+# ── Step 7b: Restart openclaw daemon (new layout only) ───────────
+# The openclaw daemon caches `tools.profile` at startup and binds the
+# tool surface (which decides whether `exec` is exposed directly vs.
+# hidden behind the `tool_search_code` meta-tool) on boot. A hot
+# config-reload picks up the new skill in skills.entries but does NOT
+# re-bind the tool surface, so if the daemon started before this
+# install set tools.profile="coding", the agent will never see `exec`
+# and won't be able to run the planet skill — it just spins on
+# `tool_search_code` calls trying to JS-discover a tool that isn't
+# in its prompt. Sending SIGTERM lets the supervisor (openshell-sandbox,
+# running as root) respawn it within ~4s with the current config.
+DID_RESTART_DAEMON=false
+if [ "$LAYOUT" = "new" ] && [ "$RESTART_DAEMON" = true ]; then
+  echo ""
+  info "Restarting openclaw daemon so tools.profile=\"coding\" takes effect..."
+  OLD_PID=$(ssh_sandbox 'pgrep -x openclaw' 2>/dev/null | head -1 || true)
+  if [ -z "$OLD_PID" ]; then
+    warn "openclaw daemon not running in sandbox; skipping restart"
+  else
+    ssh_sandbox 'pkill -TERM -x openclaw' >/dev/null 2>&1 || true
+    NEW_PID=""
+    for _i in 1 2 3 4 5 6 7 8 9 10; do
+      sleep 2
+      NEW_PID=$(ssh_sandbox 'pgrep -x openclaw' 2>/dev/null | head -1 || true)
+      if [ -n "$NEW_PID" ] && [ "$NEW_PID" != "$OLD_PID" ]; then break; fi
+      NEW_PID=""
+    done
+    if [ -n "$NEW_PID" ]; then
+      ok "openclaw daemon respawned (old PID $OLD_PID → new PID $NEW_PID)"
+      DID_RESTART_DAEMON=true
+    else
+      warn "openclaw daemon did not respawn within 20s; if the agent can't"
+      warn "find the planet skill, kill it manually inside the sandbox:"
+      warn "  ssh sandbox@openshell-$SANDBOX_NAME 'pkill -TERM -x openclaw'"
+    fi
+  fi
+fi
+
 # ── Step 8: Save host-side config ─────────────────────────────────
 mkdir -p "$INSTALL_DIR"
 cat > "$INSTALL_DIR/config.env" << CFGEOF
@@ -569,6 +614,14 @@ echo "    Status:     ./install.sh --status"
 echo "    Update key: ./install.sh --update-key"
 echo "    Uninstall:  ./install.sh --uninstall"
 echo ""
-echo -e "  ${YELLOW}If the agent doesn't recognize the skill, restart the openclaw TUI${NC}"
-echo -e "  ${YELLOW}so the gateway re-reads openclaw.json.${NC}"
+if [ "$DID_RESTART_DAEMON" = true ]; then
+  echo -e "  ${GREEN}The openclaw daemon was restarted; tools.profile=\"coding\" is live.${NC}"
+  echo -e "  ${GREEN}If you had a TUI open, reconnect: nemoclaw $SANDBOX_NAME connect${NC}"
+else
+  echo -e "  ${YELLOW}If the agent says it can't find \`exec\` or just spins on tool_search,${NC}"
+  echo -e "  ${YELLOW}restart the openclaw daemon inside the sandbox so it picks up${NC}"
+  echo -e "  ${YELLOW}tools.profile=\"coding\" cleanly:${NC}"
+  echo -e "  ${YELLOW}  ssh sandbox@openshell-$SANDBOX_NAME 'pkill -TERM -x openclaw'${NC}"
+  echo -e "  ${YELLOW}(or re-run: ./install.sh $SANDBOX_NAME — it will do this for you)${NC}"
+fi
 echo ""
