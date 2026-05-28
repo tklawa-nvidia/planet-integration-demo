@@ -386,19 +386,33 @@ info "Applying network policy..."
 CURRENT_POLICY=$("$OPENSHELL_BIN" policy get "$SANDBOX_NAME" --full 2>/dev/null | sed '1,/^---$/d')
 POLICY_FILE=$(mktemp /tmp/planet-policy-XXXX.yaml)
 
-NEEDS_PROXY_BLOCK=true
-if echo "$CURRENT_POLICY" | grep -q "planet_proxy:"; then
-  # Already present — check if host/port match
-  CURRENT_HOST=$(echo "$CURRENT_POLICY" | awk '/planet_proxy:/,/^  [a-z]/{print}' | grep -E "^      host:" | head -1 | awk '{print $2}' | tr -d "'\"")
-  CURRENT_PORT=$(echo "$CURRENT_POLICY" | awk '/planet_proxy:/,/^  [a-z]/{print}' | grep -E "^      port:" | head -1 | awk '{print $2}')
-  if [ "$CURRENT_HOST" = "$HOST_IP" ] && [ "$CURRENT_PORT" = "$TOKEN_PORT" ]; then
-    NEEDS_PROXY_BLOCK=false
-  fi
-fi
+# Use python (single process, no fragile awk range / grep|head pipeline that
+# trips `set -euo pipefail` on a no-match grep) to introspect the policy.
+# Outputs: "<has_planet_proxy>|<host>|<port>|<has_old_planet_data_api>".
+POLICY_INFO=$(printf '%s' "$CURRENT_POLICY" | python3 - <<'PYEOF' || echo "false||| false"
+import sys, re
+p = sys.stdin.read()
+has_proxy = 'planet_proxy:' in p
+has_old   = 'planet_data_api:' in p
+host = ''
+port = ''
+m = re.search(
+    r'^  planet_proxy:\n(?:    .*\n)*?    endpoints:\n    - host:\s*[\'"]?([^\'"\n]+)[\'"]?\n      port:\s*(\d+)',
+    p, re.MULTILINE,
+)
+if m:
+    host, port = m.group(1).strip(), m.group(2).strip()
+print('{}|{}|{}|{}'.format('true' if has_proxy else 'false', host, port, 'true' if has_old else 'false'))
+PYEOF
+)
+HAS_PROXY_BLOCK=$(echo "$POLICY_INFO" | cut -d'|' -f1)
+CURRENT_HOST=$(echo "$POLICY_INFO"   | cut -d'|' -f2)
+CURRENT_PORT=$(echo "$POLICY_INFO"   | cut -d'|' -f3)
+HAS_OLD_PLANET_BLOCK=$(echo "$POLICY_INFO" | cut -d'|' -f4)
 
-HAS_OLD_PLANET_BLOCK=false
-if echo "$CURRENT_POLICY" | grep -q "planet_data_api:"; then
-  HAS_OLD_PLANET_BLOCK=true
+NEEDS_PROXY_BLOCK=true
+if [ "$HAS_PROXY_BLOCK" = "true" ] && [ "$CURRENT_HOST" = "$HOST_IP" ] && [ "$CURRENT_PORT" = "$TOKEN_PORT" ]; then
+  NEEDS_PROXY_BLOCK=false
 fi
 
 if [ "$NEEDS_PROXY_BLOCK" = true ] || [ "$HAS_OLD_PLANET_BLOCK" = true ]; then
